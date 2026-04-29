@@ -1,13 +1,14 @@
 {
   "name": "laser_control",
   "version": "1.0.0",
-  "description": "Combined HTTP + WebSocket server for EC200U-CN",
+  "description": "Backend for Remote HMI Control",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
     "express": "^4.18.2",
-    "ws": "^8.14.2"
+    "ws": "^8.14.2",
+    "cors": "^2.8.5"          
   }
 }

@@ -1,0 +1,23 @@
+# Node modules
+node_modules/
+
+# Firebase service account key (secret)
+serviceAccountKey.json
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.swp

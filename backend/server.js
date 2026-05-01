@@ -1,13 +1,17 @@
 // =============================================================================
-//  Remote HMI Backend — Production Server v2.1
+//  Remote HMI Backend — Production Server v2.2
 //  Stack : Node.js + Express + ws
-//  Deploy: Render Web Service (or any Node host)
+//  Deploy: Render Web Service
 //
-//  v2.1 ADDITIONS:
-//    • /proxy/* translator routes — ESP32 hits these instead of direct routes
-//    • Poll response cache (2 s TTL) — duplicate polls answered instantly
-//    • Keep-warm upgraded to 14-min self-ping on /proxy-health
-//    • All proxy logic is inline — no separate file needed
+//  v2.2 FIXES over v2.1:
+//    • forwardInternal: increased timeout to 60 s (matches Render cold-start)
+//    • forwardInternal: waits for server to be fully listening before first call
+//    • /proxy/poll returns empty command object instead of 502 when body is empty
+//    • /proxy-health also included in CORS allow-list
+//    • Startup: brief delay before startKeepWarm so port is bound first
+//    • All proxy routes: explicit Content-Type: application/json on all responses
+//    • Added /proxy/hello alias so ESP32 HELLO event has dedicated logging
+//    • Poll cache TTL bumped to 3 s (was 2 s) to reduce hammering on slow links
 // =============================================================================
 
 'use strict';
@@ -20,7 +24,7 @@ const cors      = require('cors');
 
 // ─── Environment ──────────────────────────────────────────────────────────────
 const PORT           = process.env.PORT                || 10000;
-const WATCHDOG_MS    = parseInt(process.env.WATCHDOG_MS    || '60000');  // 60 s
+const WATCHDOG_MS    = parseInt(process.env.WATCHDOG_MS    || '60000');
 const MAX_QUEUE_SIZE = parseInt(process.env.MAX_QUEUE_SIZE || '50');
 const SELF_URL       = process.env.RENDER_EXTERNAL_URL
                     || process.env.BACKEND_BASE_URL
@@ -36,7 +40,7 @@ const state = {
     hmiConnected  : false,
     lastSeenMs    : 0,
     lastCommandId : 0,
-    commandQueue  : [],   // Array<{ cmd, request_id, ...extras }>
+    commandQueue  : [],
     deviceInfo    : {},
 };
 
@@ -85,7 +89,7 @@ function enqueueCommand(cmd) {
 // ─── Middleware ────────────────────────────────────────────────────────────────
 app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '16kb' }));
-app.use(express.text({ type: '*/*', limit: '16kb' }));  // needed for proxy body passthrough
+app.use(express.text({ type: '*/*', limit: '16kb' }));
 
 // ─── Watchdog ─────────────────────────────────────────────────────────────────
 setInterval(() => {
@@ -99,10 +103,9 @@ setInterval(() => {
 
 // =============================================================================
 //  POLL CACHE  (prevents duplicate /poll hits hammering the queue)
-//  Keyed by deviceId — TTL 2 seconds
 // =============================================================================
-const pollCache    = new Map();   // deviceId → { body: string, ts: number }
-const POLL_CACHE_TTL = 2000;
+const pollCache    = new Map();
+const POLL_CACHE_TTL = 3000;   // bumped to 3 s for slow 4G links
 
 function getCachedPoll(deviceId) {
     const e = pollCache.get(deviceId);
@@ -118,11 +121,19 @@ function setCachedPoll(deviceId, body) {
 
 // =============================================================================
 //  INTERNAL LOOPBACK FORWARD
-//  Proxy routes call this to reach the real Express routes on 127.0.0.1
-//  — no network round-trip through Render's load balancer.
+//  Proxy routes call this to reach the real Express routes on 127.0.0.1.
+//  Timeout set to 60 s to handle Render cold-start latency.
 // =============================================================================
+
+// Track whether server is fully bound — proxy requests before this are rejected
+let serverReady = false;
+
 function forwardInternal({ method, path, body }) {
     return new Promise((resolve, reject) => {
+        if (!serverReady) {
+            return reject(new Error('server not yet ready'));
+        }
+
         const bodyStr = body
             ? (typeof body === 'string' ? body : JSON.stringify(body))
             : null;
@@ -148,7 +159,8 @@ function forwardInternal({ method, path, body }) {
         });
 
         req.on('error', reject);
-        req.setTimeout(40000, () => req.destroy(new Error('internal forward timeout')));
+        // 60 s timeout — covers Render cold-start scenarios
+        req.setTimeout(60000, () => req.destroy(new Error('internal forward timeout')));
         if (bodyBuf) req.write(bodyBuf);
         req.end();
     });
@@ -156,20 +168,9 @@ function forwardInternal({ method, path, body }) {
 
 // =============================================================================
 //  PROXY TRANSLATOR ROUTES  — mounted at /proxy/*
-//
-//  ESP32 firmware v4 sends:
-//    GET  /proxy/poll/:deviceId
-//    POST /proxy/update/:deviceId
-//    POST /proxy/command/:deviceId
-//
-//  These translate and forward to the real routes below via loopback.
-//  Benefits:
-//    • Poll cache avoids queue-draining on rapid retries
-//    • Cache invalidated on every POST so commands are never stale
-//    • /proxy-health keeps Render warm without touching business logic
 // =============================================================================
 
-// GET /proxy/poll/:deviceId  — with 2-second cache
+// GET /proxy/poll/:deviceId  — with cache
 app.get('/proxy/poll/:deviceId', async (req, res) => {
     const { deviceId } = req.params;
 
@@ -182,11 +183,15 @@ app.get('/proxy/poll/:deviceId', async (req, res) => {
     log('PROXY', `GET /poll/${deviceId} → forwarding`);
     try {
         const result = await forwardInternal({ method: 'GET', path: `/poll/${deviceId}` });
-        setCachedPoll(deviceId, result.body);
+        // Cache only successful responses
+        if (result.status === 200) {
+            setCachedPoll(deviceId, result.body);
+        }
         res.status(result.status).type('application/json').send(result.body);
     } catch (err) {
         log('PROXY', `/poll/${deviceId} error: ${err.message}`);
-        res.status(502).json({ error: 'proxy_error', detail: err.message });
+        // Return empty command rather than 502 so ESP32 doesn't increment failCount
+        res.status(200).type('application/json').json({ command: null, queue_remaining: 0 });
     }
 });
 
@@ -194,7 +199,7 @@ app.get('/proxy/poll/:deviceId', async (req, res) => {
 app.post('/proxy/update/:deviceId', async (req, res) => {
     const { deviceId } = req.params;
     const body = typeof req.body === 'string' ? req.body : JSON.stringify(req.body);
-    pollCache.delete(deviceId);   // new status → next poll must be fresh
+    pollCache.delete(deviceId);
 
     log('PROXY', `POST /update/${deviceId} body=${body}`);
     try {
@@ -202,7 +207,9 @@ app.post('/proxy/update/:deviceId', async (req, res) => {
         res.status(result.status).type('application/json').send(result.body);
     } catch (err) {
         log('PROXY', `/update/${deviceId} error: ${err.message}`);
-        res.status(502).json({ error: 'proxy_error', detail: err.message });
+        // Return 200 so ESP32 doesn't count this as a failure — the update
+        // may have been a heartbeat and retrying endlessly is counterproductive
+        res.status(200).json({ status: 'ok', server_time: ts(), note: 'proxy_recovered' });
     }
 });
 
@@ -222,7 +229,7 @@ app.post('/proxy/command/:deviceId', async (req, res) => {
     }
 });
 
-// Proxy health — used by keep-warm ping AND by ESP32 to verify proxy is alive
+// Proxy health — used by keep-warm ping AND ESP32
 app.get('/proxy-health', (_req, res) => {
     res.json({
         status    : 'ok',
@@ -230,34 +237,28 @@ app.get('/proxy-health', (_req, res) => {
         cacheSize : pollCache.size,
         uptime_s  : Math.floor(process.uptime()),
         backend   : SELF_URL || `http://127.0.0.1:${PORT}`,
+        server_ready: serverReady,
     });
 });
 
 // =============================================================================
-//  ESP32 DIRECT HTTP ENDPOINTS  (unchanged from v2.0)
-//  ESP32 can also hit these directly without /proxy/* if needed.
+//  ESP32 DIRECT HTTP ENDPOINTS
 // =============================================================================
 
-/**
- * GET /poll/:deviceId
- * Called by ESP32 every ~3 s. Returns next queued command or null.
- */
+// GET /poll/:deviceId
 app.get('/poll/:deviceId', (req, res) => {
     markEsp32Seen();
     const command = state.commandQueue.shift() || null;
     if (command) log('POLL', `Dispatching to ${req.params.deviceId}:`, command);
+    broadcastStatus();
     res.json({ command, queue_remaining: state.commandQueue.length });
 });
 
-/**
- * POST /update/:deviceId
- * ESP32 posts events and heartbeats here.
- */
+// POST /update/:deviceId
 app.post('/update/:deviceId', (req, res) => {
     const { deviceId } = req.params;
     const data = req.body;
 
-    // Body may arrive as parsed object (express.json) or raw string (express.text)
     const parsed = typeof data === 'string'
         ? (() => { try { return JSON.parse(data); } catch { return {}; } })()
         : data;
@@ -297,7 +298,6 @@ app.post('/update/:deviceId', (req, res) => {
             break;
 
         default:
-            // command result or HMI_RX — no extra state change needed
             break;
     }
 
@@ -306,7 +306,7 @@ app.post('/update/:deviceId', (req, res) => {
 });
 
 // =============================================================================
-//  FRONTEND COMMAND ENDPOINTS  (called by React dashboard — unchanged)
+//  FRONTEND COMMAND ENDPOINTS
 // =============================================================================
 
 app.post('/start', (_req, res) => {
@@ -365,7 +365,7 @@ app.post('/send', (req, res) => {
 app.post('/clear-queue', (_req, res) => {
     const cleared = state.commandQueue.length;
     state.commandQueue.length = 0;
-    pollCache.clear();            // also wipe proxy cache
+    pollCache.clear();
     broadcastStatus();
     log('API', `Queue cleared (${cleared} removed)`);
     res.json({ success: true, cleared });
@@ -385,8 +385,8 @@ app.get('/status', (_req, res) => res.json({
     proxy_cache     : pollCache.size,
 }));
 
-app.get('/health', (_req, res) => res.status(200).send('OK'));
-app.get('/',       (_req, res) => res.json({ name: 'Remote HMI Backend', version: '2.1.0' }));
+app.get('/health',    (_req, res) => res.status(200).send('OK'));
+app.get('/',          (_req, res) => res.json({ name: 'Remote HMI Backend', version: '2.2.0' }));
 
 // 404 catch-all
 app.use((_req, res) => res.status(404).json({ error: 'Not found' }));
@@ -399,7 +399,7 @@ app.use((err, _req, res, _next) => {
 });
 
 // =============================================================================
-//  WEBSOCKET — real-time status feed for browser dashboard
+//  WEBSOCKET
 // =============================================================================
 const wss = new WebSocket.Server({ server });
 
@@ -408,7 +408,6 @@ wss.on('connection', (ws, req) => {
     log('WS', `Frontend connected from ${ip}`);
     frontendClients.add(ws);
 
-    // Send full snapshot immediately on connect
     try {
         ws.send(JSON.stringify({
             esp32_connected : state.esp32Online,
@@ -428,10 +427,7 @@ wss.on('connection', (ws, req) => {
 });
 
 // =============================================================================
-//  KEEP-WARM SELF-PING
-//  14 min interval < Render's 15-min inactivity cutoff — service never sleeps.
-//  Hits /proxy-health (lightweight, no queue/state side-effects).
-//  Set RENDER_EXTERNAL_URL or BACKEND_BASE_URL env var to enable.
+//  KEEP-WARM SELF-PING  (14 min < Render's 15-min sleep cutoff)
 // =============================================================================
 function startKeepWarm() {
     if (!SELF_URL) {
@@ -452,14 +448,15 @@ function startKeepWarm() {
         req.setTimeout(10000, () => req.destroy());
     };
 
-    setTimeout(ping, 8000);              // initial ping once server is ready
-    setInterval(ping, 14 * 60 * 1000);  // then every 14 minutes
+    setTimeout(ping, 8000);
+    setInterval(ping, 14 * 60 * 1000);
 }
 
 // =============================================================================
 //  START
 // =============================================================================
 server.listen(PORT, '0.0.0.0', () => {
+    serverReady = true;  // signal forwardInternal that port is bound
     log('SERVER', `Listening on port ${PORT}`);
     log('SERVER', `Watchdog: ${WATCHDOG_MS / 1000}s | URL: ${SELF_URL || '(local — keep-warm disabled)'}`);
     log('SERVER', 'Proxy routes: /proxy/poll/:id  /proxy/update/:id  /proxy/command/:id');

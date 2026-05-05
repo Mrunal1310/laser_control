@@ -1,39 +1,33 @@
-// =============================================================================
-//  Remote HMI Backend — Production Server v2.0
-//  Stack : Node.js + Express + ws
-//  Deploy: Render Web Service (or any Node host)
-// =============================================================================
-
+// server.js – MQTT Bridge for ESP32
 'use strict';
 
 const express   = require('express');
 const WebSocket = require('ws');
 const http      = require('http');
 const cors      = require('cors');
+const mqtt      = require('mqtt');
 
-// ─── Environment ─────────────────────────────────────────────────────────────
+// ─── Environment ─────────────────────────────────────────────
 const PORT             = process.env.PORT              || 10000;
-const WATCHDOG_MS      = parseInt(process.env.WATCHDOG_MS     || '60000');   // 60 s
+const WATCHDOG_MS      = parseInt(process.env.WATCHDOG_MS     || '60000');
 const MAX_QUEUE_SIZE   = parseInt(process.env.MAX_QUEUE_SIZE   || '50');
-const SELF_URL         = process.env.RENDER_EXTERNAL_URL || '';               // auto-set by Render
+const SELF_URL         = process.env.RENDER_EXTERNAL_URL || '';
 
-// ─── App + Server ─────────────────────────────────────────────────────────────
+// ─── App + Server ──────────────────────────────────────────
 const app    = express();
 const server = http.createServer(app);
 
-// ─── Shared State ─────────────────────────────────────────────────────────────
+// ─── Shared State ──────────────────────────────────────────
 const state = {
     esp32Online   : false,
     hmiConnected  : false,
     lastSeenMs    : 0,
     lastCommandId : 0,
-    commandQueue  : [],   // Array<{ cmd, request_id, ...extras }>
-    deviceInfo    : {},   // populated on HELLO from ESP32
+    deviceInfo    : {},
 };
+const frontendClients = new Set();   // WebSocket connections
 
-const frontendClients = new Set();   // active WebSocket browser connections
-
-// ─── Utilities ────────────────────────────────────────────────────────────────
+// ─── Utilities ──────────────────────────────────────────────
 const ts  = () => new Date().toISOString();
 const log = (tag, msg, extra) => {
     const line = `[${ts()}] [${tag}] ${msg}`;
@@ -45,16 +39,14 @@ function broadcastStatus() {
         esp32_connected : state.esp32Online,
         hmi_connected   : state.hmiConnected,
         message         : state.esp32Online
-                            ? (state.hmiConnected ? 'HMI connected' : 'ESP32 online, HMI idle')
+                            ? (state.hmiConnected ? 'HMI connected' : 'ESP32 online')
                             : 'ESP32 offline',
         last_ping       : ts(),
-        command_pending : state.commandQueue.length > 0,
-        queue_length    : state.commandQueue.length,
         device_info     : state.deviceInfo,
     });
     for (const ws of frontendClients) {
         if (ws.readyState === WebSocket.OPEN) {
-            try { ws.send(payload); } catch { /* stale socket — ignore */ }
+            try { ws.send(payload); } catch { /* ignore */ }
         }
     }
 }
@@ -64,21 +56,11 @@ function markEsp32Seen() {
     state.lastSeenMs  = Date.now();
 }
 
-function enqueueCommand(cmd) {
-    if (state.commandQueue.length >= MAX_QUEUE_SIZE) {
-        log('QUEUE', `Full (${MAX_QUEUE_SIZE}) — dropping oldest`);
-        state.commandQueue.shift();
-    }
-    state.commandQueue.push(cmd);
-    broadcastStatus();
-}
-
-// ─── Middleware ────────────────────────────────────────────────────────────────
-// NOTE: Do NOT touch x-forwarded-proto. Render terminates TLS before Express.
+// ─── Middleware ─────────────────────────────────────────────
 app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '16kb' }));
 
-// ─── Watchdog: mark ESP32 offline if silent for WATCHDOG_MS ─────────────────
+// ─── Watchdog ──────────────────────────────────────────────
 setInterval(() => {
     if (state.esp32Online && Date.now() - state.lastSeenMs > WATCHDOG_MS) {
         log('WATCHDOG', 'ESP32 timed out — marking offline');
@@ -88,7 +70,7 @@ setInterval(() => {
     }
 }, 10_000);
 
-// ─── Keep-alive: prevent Render free-tier sleep (pings every 10 min) ─────────
+// ─── Keep‑alive for Render free tier ───────────────────────
 if (SELF_URL) {
     setInterval(() => {
         require('https').get(`${SELF_URL}/health`, res =>
@@ -99,207 +81,128 @@ if (SELF_URL) {
     }, 10 * 60 * 1000);
 }
 
-// =============================================================================
-//  ESP32 HTTP Endpoints
-// =============================================================================
+// =========================================================================
+//  MQTT Bridge (public broker, port 1883)
+// =========================================================================
+const mqttClient = mqtt.connect('mqtt://broker.emqx.io:1883');
 
-/**
- * GET /poll/:deviceId
- * Called by ESP32 every ~3 s to retrieve the next queued command.
- * Returns: { command: {...} | null, queue_remaining: number }
- */
-app.get('/poll/:deviceId', (req, res) => {
-    markEsp32Seen();
-    const command = state.commandQueue.shift() || null;
-    if (command) log('POLL', `Dispatching to ${req.params.deviceId}:`, command);
-    res.json({ command, queue_remaining: state.commandQueue.length });
+mqttClient.on('connect', () => {
+    log('MQTT', 'Connected to broker');
+    mqttClient.subscribe('status/esp32_001');
+});
+mqttClient.on('message', (topic, msg) => {
+    if (topic === 'status/esp32_001') {
+        const data = msg.toString();
+        log('MQTT', 'ESP32 status:', data);
+        // Update local state if needed
+        try {
+            const json = JSON.parse(data);
+            if (json.online !== undefined) {
+                markEsp32Seen();
+                if (json.hmiConnected !== undefined) state.hmiConnected = json.hmiConnected;
+                if (json.info) state.deviceInfo = json.info;
+                broadcastStatus();
+            } else {
+                // Just forward to frontend as is
+                broadcastStatus(); // but status already being sent? We'll broadcast separately
+                // Actually we should broadcast this specific status to the frontend
+                for (const ws of frontendClients) {
+                    if (ws.readyState === WebSocket.OPEN) ws.send(data);
+                }
+            }
+        } catch (e) {
+            // not JSON or malformed – still forward raw
+            for (const ws of frontendClients) {
+                if (ws.readyState === WebSocket.OPEN) ws.send(data);
+            }
+        }
+    }
 });
 
-/**
- * POST /update/:deviceId
- * ESP32 posts events and heartbeats here.
- *
- * Accepted bodies:
- *   { event: "HELLO",           fw, apn, version }
- *   { event: "HMI_CONNECTED",   hmi_ip, hmi_port }
- *   { event: "HMI_DISCONNECTED" }
- *   { event: "HMI_RX",          data }
- *   { type:  "PING" }
- *   { request_id, status, error? }    ← command result
- */
-app.post('/update/:deviceId', (req, res) => {
-    const { deviceId } = req.params;
-    const data = req.body;
+// Helper to publish command to MQTT
+function publishCommand(cmdObj) {
+    mqttClient.publish('command/esp32_001', JSON.stringify(cmdObj));
+    log('MQTT', `Command published: ${JSON.stringify(cmdObj)}`);
+}
 
-    if (!data || typeof data !== 'object') {
-        return res.status(400).json({ error: 'Invalid JSON body' });
-    }
-
-    markEsp32Seen();
-    log('UPDATE', `From ${deviceId}:`, data);
-
-    const key = data.event || data.type;
-    switch (key) {
-        case 'HELLO':
-            state.deviceInfo = {
-                device_id    : deviceId,
-                fw           : data.fw      || 'unknown',
-                apn          : data.apn     || 'unknown',
-                version      : data.version || 'unknown',
-                connected_at : ts(),
-            };
-            log('HELLO', `Registered — fw=${state.deviceInfo.fw}  apn=${state.deviceInfo.apn}`);
-            break;
-
-        case 'HMI_CONNECTED':
-            state.hmiConnected = true;
-            log('HMI', `Connected → ${data.hmi_ip}:${data.hmi_port}`);
-            break;
-
-        case 'HMI_DISCONNECTED':
-            state.hmiConnected = false;
-            log('HMI', 'Disconnected');
-            break;
-
-        case 'PING':
-            // heartbeat — markEsp32Seen() already called above
-            break;
-
-        default:
-            // command result or HMI_RX — no state change needed
-            break;
-    }
-
-    broadcastStatus();
-    res.json({ status: 'ok', server_time: ts() });
-});
-
-// =============================================================================
-//  Frontend Command Endpoints  (called by React dashboard)
-// =============================================================================
-
-app.post('/start', (_req, res) => {
+// =========================================================================
+//  Frontend API – unchanged (but now forward to MQTT instead of queue)
+// =========================================================================
+app.post('/start', (req, res) => {
     const cmd = { cmd: 'START', request_id: String(++state.lastCommandId) };
-    enqueueCommand(cmd);
-    log('API', 'START queued', cmd);
+    publishCommand(cmd);
     res.json({ success: true, request_id: cmd.request_id });
 });
 
-app.post('/stop', (_req, res) => {
+app.post('/stop', (req, res) => {
     const cmd = { cmd: 'STOP', request_id: String(++state.lastCommandId) };
-    enqueueCommand(cmd);
-    log('API', 'STOP queued', cmd);
+    publishCommand(cmd);
     res.json({ success: true, request_id: cmd.request_id });
 });
 
 app.post('/connect', (req, res) => {
     const { hmi_ip, hmi_port } = req.body || {};
     if (!hmi_ip || typeof hmi_ip !== 'string' || !hmi_ip.trim())
-        return res.status(400).json({ success: false, message: 'hmi_ip is required' });
+        return res.status(400).json({ success: false, message: 'hmi_ip required' });
     const port = parseInt(hmi_port, 10);
     if (isNaN(port) || port < 1 || port > 65535)
         return res.status(400).json({ success: false, message: 'hmi_port must be 1–65535' });
-
     const cmd = { cmd: 'CONNECT', hmi_ip: hmi_ip.trim(), hmi_port: port,
                   request_id: String(++state.lastCommandId) };
-    enqueueCommand(cmd);
-    log('API', `CONNECT queued → ${cmd.hmi_ip}:${cmd.hmi_port}`);
+    publishCommand(cmd);
     res.json({ success: true, request_id: cmd.request_id });
 });
 
-app.post('/disconnect', (_req, res) => {
+app.post('/disconnect', (req, res) => {
     const cmd = { cmd: 'DISCONNECT', request_id: String(++state.lastCommandId) };
-    enqueueCommand(cmd);
-    log('API', 'DISCONNECT queued');
+    publishCommand(cmd);
     res.json({ success: true, request_id: cmd.request_id });
 });
 
 app.post('/send', (req, res) => {
     const { data } = req.body || {};
     if (!data || typeof data !== 'string' || !data.trim())
-        return res.status(400).json({ success: false, message: 'data (string) is required' });
+        return res.status(400).json({ success: false, message: 'data (string) required' });
     if (data.length > 512)
         return res.status(400).json({ success: false, message: 'data too long (max 512 chars)' });
-
     const cmd = { cmd: 'SEND', data: data.trim(), request_id: String(++state.lastCommandId) };
-    enqueueCommand(cmd);
-    log('API', `SEND queued: ${cmd.data}`);
+    publishCommand(cmd);
     res.json({ success: true, request_id: cmd.request_id });
 });
 
-/** Flush the command queue (useful during debugging / testing) */
-app.post('/clear-queue', (_req, res) => {
-    const cleared = state.commandQueue.length;
-    state.commandQueue.length = 0;
-    broadcastStatus();
-    log('API', `Queue cleared (${cleared} removed)`);
-    res.json({ success: true, cleared });
-});
-
-// =============================================================================
-//  Info / Utility Endpoints
-// =============================================================================
-
-app.get('/status', (_req, res) => res.json({
+// Info endpoints (unchanged)
+app.get('/status', (req, res) => res.json({
     esp32_connected : state.esp32Online,
     hmi_connected   : state.hmiConnected,
-    queue_length    : state.commandQueue.length,
     device_info     : state.deviceInfo,
     last_ping       : ts(),
     uptime_s        : Math.floor(process.uptime()),
 }));
+app.get('/health', (req, res) => res.status(200).send('OK'));
+app.get('/', (req, res) => res.json({ name: 'Remote HMI Backend', version: '3.0-mqtt' }));
 
-app.get('/health', (_req, res) => res.status(200).send('OK'));
-app.get('/',       (_req, res) => res.json({ name: 'Remote HMI Backend', version: '2.0.0' }));
-
-// 404 catch-all
-app.use((_req, res) => res.status(404).json({ error: 'Not found' }));
-
-// Global error handler
-// eslint-disable-next-line no-unused-vars
-app.use((err, _req, res, _next) => {
-    log('ERROR', err.stack || err.message);
-    res.status(500).json({ error: 'Internal server error' });
-});
-
-// =============================================================================
-//  WebSocket — real-time status feed for browser
-// =============================================================================
+// =========================================================================
+//  WebSocket for frontend (unchanged)
+// =========================================================================
 const wss = new WebSocket.Server({ server });
-
 wss.on('connection', (ws, req) => {
     const ip = req.socket.remoteAddress || 'unknown';
     log('WS', `Frontend connected from ${ip}`);
     frontendClients.add(ws);
-
-    // Send full state snapshot immediately on connect
     try {
         ws.send(JSON.stringify({
             esp32_connected : state.esp32Online,
             hmi_connected   : state.hmiConnected,
-            message         : state.esp32Online
-                               ? (state.hmiConnected ? 'HMI connected' : 'ESP32 online')
-                               : 'ESP32 offline',
+            message         : state.esp32Online ? (state.hmiConnected ? 'HMI connected' : 'ESP32 online') : 'ESP32 offline',
             last_ping       : ts(),
-            command_pending : state.commandQueue.length > 0,
-            queue_length    : state.commandQueue.length,
             device_info     : state.deviceInfo,
         }));
     } catch { /* ignore */ }
-
-    ws.on('close', () => { frontendClients.delete(ws); log('WS', `Disconnected (${ip})`); });
-    ws.on('error', err  => { frontendClients.delete(ws); log('WS', `Error: ${err.message}`); });
+    ws.on('close', () => frontendClients.delete(ws));
 });
 
-// =============================================================================
-//  Start
-// =============================================================================
+// Start server
 server.listen(PORT, '0.0.0.0', () => {
     log('SERVER', `Listening on port ${PORT}`);
     log('SERVER', `Watchdog ${WATCHDOG_MS / 1000}s | Keep-alive: ${SELF_URL || 'disabled'}`);
-});
-
-process.on('SIGTERM', () => {
-    log('SERVER', 'SIGTERM — shutting down gracefully');
-    server.close(() => process.exit(0));
 });

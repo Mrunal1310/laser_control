@@ -7,19 +7,19 @@ app.use(cors());
 app.use(express.json());
 
 // ===============================
-// HiveMQ Cloud TLS Settings
+// HiveMQ Cloud TLS Broker
 // ===============================
 const MQTT_HOST = "c1e68200354e42858661c5180464a682.s1.eu.hivemq.cloud";
 const MQTT_PORT = 8883;
 
-// Your HiveMQ username/password
-const MQTT_USERNAME = "YOUR_USERNAME";
-const MQTT_PASSWORD = "YOUR_PASSWORD";
+const MQTT_USERNAME = "esp32";
+const MQTT_PASSWORD = "Esp32@123";
 
 // Topics
 const TOPIC_UI_TO_ESP32 = "laser/ui/to/esp32";
 const TOPIC_ESP32_TO_UI = "laser/esp32/to/ui";
 
+// store latest ESP32 msg
 let latestFromEsp32 = "No message yet";
 
 // ===============================
@@ -28,7 +28,9 @@ let latestFromEsp32 = "No message yet";
 const client = mqtt.connect(`mqtts://${MQTT_HOST}:${MQTT_PORT}`, {
   username: MQTT_USERNAME,
   password: MQTT_PASSWORD,
-  rejectUnauthorized: true
+  rejectUnauthorized: true,
+  keepalive: 60,
+  reconnectPeriod: 5000
 });
 
 client.on("connect", () => {
@@ -43,9 +45,13 @@ client.on("connect", () => {
   });
 });
 
+client.on("error", (err) => {
+  console.log("MQTT ERROR:", err);
+});
+
 client.on("message", (topic, message) => {
   const msg = message.toString();
-  console.log("RX:", topic, msg);
+  console.log("MQTT RX:", topic, msg);
 
   if (topic === TOPIC_ESP32_TO_UI) {
     latestFromEsp32 = msg;
@@ -56,7 +62,7 @@ client.on("message", (topic, message) => {
 // API ROUTES
 // ===============================
 
-// UI sends message -> MQTT -> ESP32
+// UI -> Render -> MQTT -> ESP32
 app.post("/send", (req, res) => {
   const message = req.body.message;
 
@@ -69,7 +75,7 @@ app.post("/send", (req, res) => {
   res.json({ status: "Sent to ESP32 via MQTT TLS" });
 });
 
-// UI reads ESP32 latest message
+// UI reads latest message from ESP32
 app.get("/esp32msg", (req, res) => {
   res.json({ message: latestFromEsp32 });
 });
@@ -79,6 +85,7 @@ app.get("/", (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
+
 app.listen(PORT, () => {
   console.log("Server running on port", PORT);
 });

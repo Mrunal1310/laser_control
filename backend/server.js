@@ -3,7 +3,10 @@ const cors = require("cors");
 
 const app = express();
 
-app.use(cors());
+app.use(cors({
+    origin: "*"
+}));
+
 app.use(express.json());
 
 let latestMessage = "No Message";
@@ -26,9 +29,9 @@ app.get("/message", (req, res) => {
     });
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = 3000;
 
 app.listen(PORT, () => {
 
-    console.log("Server Running");
+    console.log(`Server Running On ${PORT}`);
 });

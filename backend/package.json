@@ -14,7 +14,7 @@
   "dependencies": {
     "cors": "^2.8.6",
     "express": "^4.22.1",
-    "mqtt": "4.3.7",
+    "mqtt": "^4.3.7",
     "readable-stream": "^4.5.2",
     "ws": "^8.14.2"
   }

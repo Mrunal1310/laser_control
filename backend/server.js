@@ -3,7 +3,8 @@ const cors = require("cors");
 const mqtt = require("mqtt");
 const crypto = require("crypto");
 const http = require("http");
-const { WebSocketServer } = require("ws");
+const WebSocket = require("ws");
+
 
 const app = express();
 app.use(cors());

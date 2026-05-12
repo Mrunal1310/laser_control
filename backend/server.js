@@ -1,107 +1,140 @@
 const express = require("express");
 const cors = require("cors");
 const mqtt = require("mqtt");
+const crypto = require("crypto");
+const http = require("http");
+const { WebSocketServer } = require("ws");
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ==============================
-// HiveMQ Cloud TLS Config
-// ==============================
-const MQTT_HOST = "c1e68200354e42858661c5180464a682.s1.eu.hivemq.cloud";
-const MQTT_PORT = 8883;
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server });
 
-const MQTT_USERNAME = "esp32";
-const MQTT_PASSWORD = "Esp32@123";
+const MQTT_HOST = process.env.MQTT_HOST;
+const MQTT_PORT = process.env.MQTT_PORT || 8883;
+const MQTT_USERNAME = process.env.MQTT_USERNAME;
+const MQTT_PASSWORD = process.env.MQTT_PASSWORD;
+const PORT = process.env.PORT || 3000;
 
-// Topics
-const TOPIC_UI_TO_ESP32 = "laser/ui/to/esp32";
-const TOPIC_ESP32_TO_UI = "laser/esp32/to/ui";
+const DEVICE_ID = "device01";
+const TOPIC_CMD = `laser/${DEVICE_ID}/cmd`;
+const TOPIC_ACK = `laser/${DEVICE_ID}/ack`;
+const TOPIC_STATUS = `laser/${DEVICE_ID}/status`;
 
-// Store latest message from ESP32
-let latestFromEsp32 = "No message yet";
+let latestStatus = { state: "OFFLINE" };
+let latestAck = { info: "No ack yet" };
 
-// ==============================
-// MQTT Connect (TLS)
-// ==============================
-console.log("Connecting to HiveMQ TLS broker...");
-
-const client = mqtt.connect(`mqtts://${MQTT_HOST}:${MQTT_PORT}`, {
+const mqttClient = mqtt.connect(`mqtts://${MQTT_HOST}:${MQTT_PORT}`, {
   username: MQTT_USERNAME,
   password: MQTT_PASSWORD,
   keepalive: 60,
   reconnectPeriod: 5000,
-  clean: true
+  clean: true,
+  clientId: `render_gateway_${Math.random().toString(16).slice(2, 10)}`
 });
 
-client.on("connect", () => {
-  console.log("MQTT Connected Successfully!");
+mqttClient.on("connect", () => {
+  console.log("MQTT connected");
 
-  client.subscribe(TOPIC_ESP32_TO_UI, { qos: 0 }, (err) => {
-    if (err) {
-      console.log("MQTT Subscribe Error:", err);
-    } else {
-      console.log("Subscribed to:", TOPIC_ESP32_TO_UI);
-    }
+  mqttClient.subscribe([TOPIC_ACK, TOPIC_STATUS], { qos: 1 }, (err) => {
+    if (err) console.error("Subscribe error:", err);
+    else console.log("Subscribed to ACK and STATUS topics");
   });
 });
 
-client.on("reconnect", () => {
-  console.log("MQTT reconnecting...");
+mqttClient.on("error", (err) => {
+  console.error("MQTT error:", err.message);
 });
 
-client.on("error", (err) => {
-  console.log("MQTT ERROR:", err.message);
-});
+mqttClient.on("message", (topic, message) => {
+  const raw = message.toString();
+  let payload;
 
-client.on("close", () => {
-  console.log("MQTT connection closed");
-});
+  try {
+    payload = JSON.parse(raw);
+  } catch {
+    payload = { raw };
+  }
 
-client.on("message", (topic, message) => {
-  const msg = message.toString();
-  console.log("MQTT RX:", topic, msg);
+  if (topic === TOPIC_ACK) {
+    latestAck = payload;
+    broadcast({ type: "ack", payload });
+  }
 
-  if (topic === TOPIC_ESP32_TO_UI) {
-    latestFromEsp32 = msg;
+  if (topic === TOPIC_STATUS) {
+    latestStatus = payload;
+    broadcast({ type: "status", payload });
   }
 });
 
-// ==============================
-// API Routes
-// ==============================
+function broadcast(obj) {
+  const msg = JSON.stringify(obj);
+  wss.clients.forEach((client) => {
+    if (client.readyState === 1) {
+      client.send(msg);
+    }
+  });
+}
+
+wss.on("connection", (ws) => {
+  ws.send(JSON.stringify({ type: "status", payload: latestStatus }));
+  ws.send(JSON.stringify({ type: "ack", payload: latestAck }));
+});
+
 app.get("/", (req, res) => {
-  res.send("Render MQTT Gateway Running OK");
+  res.send("Laser MQTT gateway running");
 });
 
-app.post("/send", (req, res) => {
-  const message = req.body.message;
-
-  if (!message) {
-    return res.status(400).json({ status: "Message missing" });
-  }
-
-  console.log("UI -> MQTT:", message);
-
-  client.publish(TOPIC_UI_TO_ESP32, message, { qos: 0 }, (err) => {
-    if (err) {
-      console.log("Publish error:", err);
-      return res.status(500).json({ status: "MQTT publish failed" });
-    }
-    res.json({ status: "Message sent to ESP32 via MQTT" });
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    mqttConnected: mqttClient.connected,
+    latestStatus,
+    latestAck
   });
 });
 
-app.get("/esp32msg", (req, res) => {
-  res.json({ message: latestFromEsp32 });
+app.post("/api/device/:id/command", (req, res) => {
+  const { id } = req.params;
+  const { action, params } = req.body;
+
+  if (id !== DEVICE_ID) {
+    return res.status(404).json({ error: "Unknown device" });
+  }
+
+  const allowedActions = [
+    "start_hmi",
+    "stop_hmi",
+    "show_message",
+    "start_print",
+    "stop_print",
+    "get_status"
+  ];
+
+  if (!allowedActions.includes(action)) {
+    return res.status(400).json({ error: "Invalid action" });
+  }
+
+  const cmd = {
+    cmdId: crypto.randomUUID(),
+    deviceId: id,
+    action,
+    params: params || {},
+    ts: new Date().toISOString()
+  };
+
+  mqttClient.publish(TOPIC_CMD, JSON.stringify(cmd), { qos: 1 }, (err) => {
+    if (err) {
+      console.error("Publish failed:", err);
+      return res.status(500).json({ error: "MQTT publish failed" });
+    }
+
+    res.json({ ok: true, cmdId: cmd.cmdId });
+  });
 });
 
-// ==============================
-// Start Server
-// ==============================
-const PORT = process.env.PORT || 3000;
-
-app.listen(PORT, () => {
-  console.log("Server running on port:", PORT);
+server.listen(PORT, () => {
+  console.log(`Server listening on ${PORT}`);
 });

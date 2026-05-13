@@ -1,187 +1,226 @@
-const express = require("express");
-const cors = require("cors");
-const mqtt = require("mqtt");
-const crypto = require("crypto");
-const http = require("http");
-const WebSocket = require("ws");
+require('dotenv').config();
 
-const requiredEnv = ["MQTT_HOST", "MQTT_PORT", "MQTT_USERNAME", "MQTT_PASSWORD"];
-for (const key of requiredEnv) {
-  if (!process.env[key]) {
-    console.error(`Missing required environment variable: ${key}`);
-    process.exit(1);
-  }
-}
+const express = require('express');
+const cors = require('cors');
+const http = require('http');
+const WebSocket = require('ws');
+const mqtt = require('mqtt');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
+const PORT = process.env.PORT || 10000;
+const DEVICE_ID = process.env.DEVICE_ID || 'device01';
 
-const PORT = process.env.PORT || 3000;
 const MQTT_HOST = process.env.MQTT_HOST;
-const MQTT_PORT = Number(process.env.MQTT_PORT);
+const MQTT_PORT = Number(process.env.MQTT_PORT || 8883);
 const MQTT_USERNAME = process.env.MQTT_USERNAME;
 const MQTT_PASSWORD = process.env.MQTT_PASSWORD;
 
-const DEVICE_ID = "device01";
 const TOPIC_CMD = `laser/${DEVICE_ID}/cmd`;
 const TOPIC_ACK = `laser/${DEVICE_ID}/ack`;
 const TOPIC_STATUS = `laser/${DEVICE_ID}/status`;
 
 let latestStatus = {
   deviceId: DEVICE_ID,
-  state: "OFFLINE",
-  info: "No status yet",
+  state: 'UNKNOWN',
+  info: 'No status yet',
   ts: new Date().toISOString()
 };
 
-let latestAck = {
-  deviceId: DEVICE_ID,
-  info: "No ack yet",
-  ts: new Date().toISOString()
-};
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
+const wsClients = new Set();
 
-console.log("MQTT config:", {
+function broadcast(data) {
+  const msg = JSON.stringify(data);
+  for (const client of wsClients) {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(msg);
+    }
+  }
+}
+
+wss.on('connection', (ws) => {
+  console.log('WebSocket client connected');
+  wsClients.add(ws);
+
+  ws.send(JSON.stringify({
+    type: 'server_info',
+    mqttConnected: mqttClient.connected,
+    deviceId: DEVICE_ID,
+    latestStatus
+  }));
+
+  ws.on('close', () => {
+    wsClients.delete(ws);
+    console.log('WebSocket client disconnected');
+  });
+});
+
+console.log('MQTT config:', {
   MQTT_HOST,
   MQTT_PORT,
   MQTT_USERNAME
 });
 
-const mqttClient = mqtt.connect({
-  host: MQTT_HOST,
-  port: MQTT_PORT,
-  protocol: "mqtts",
+const mqttClient = mqtt.connect(`mqtts://${MQTT_HOST}:${MQTT_PORT}`, {
   username: MQTT_USERNAME,
   password: MQTT_PASSWORD,
-  keepalive: 60,
   reconnectPeriod: 5000,
   clean: true,
-  rejectUnauthorized: true,
-  clientId: `render_gateway_${Math.random().toString(16).slice(2, 10)}`
+  connectTimeout: 30000
 });
 
-mqttClient.on("connect", () => {
-  console.log("MQTT connected");
+mqttClient.on('connect', () => {
+  console.log('MQTT connected');
 
   mqttClient.subscribe([TOPIC_ACK, TOPIC_STATUS], { qos: 1 }, (err) => {
     if (err) {
-      console.error("MQTT subscribe error:", err.message);
-    } else {
-      console.log("Subscribed:", TOPIC_ACK, TOPIC_STATUS);
+      console.error('Subscribe error:', err.message);
+      return;
     }
+    console.log(`Subscribed: ${TOPIC_ACK} ${TOPIC_STATUS}`);
+  });
+
+  broadcast({
+    type: 'mqtt_connection',
+    connected: true,
+    ts: new Date().toISOString()
   });
 });
 
-mqttClient.on("reconnect", () => {
-  console.log("MQTT reconnecting...");
+mqttClient.on('reconnect', () => {
+  console.log('MQTT reconnecting...');
 });
 
-mqttClient.on("close", () => {
-  console.log("MQTT closed");
+mqttClient.on('error', (err) => {
+  console.error('MQTT error:', err.message);
 });
 
-mqttClient.on("error", (err) => {
-  console.error("MQTT error:", err.message);
+mqttClient.on('close', () => {
+  console.log('MQTT disconnected');
+  broadcast({
+    type: 'mqtt_connection',
+    connected: false,
+    ts: new Date().toISOString()
+  });
 });
 
-mqttClient.on("message", (topic, message) => {
-  const raw = message.toString();
+mqttClient.on('message', (topic, message) => {
+  const text = message.toString();
+  console.log('MQTT IN =>', topic, text);
+
   let payload;
-
   try {
-    payload = JSON.parse(raw);
-  } catch {
-    payload = {
-      deviceId: DEVICE_ID,
-      raw,
-      ts: new Date().toISOString()
-    };
-  }
-
-  if (topic === TOPIC_ACK) {
-    latestAck = payload;
-    broadcast({ type: "ack", payload });
+    payload = JSON.parse(text);
+  } catch (e) {
+    payload = { raw: text };
   }
 
   if (topic === TOPIC_STATUS) {
-    latestStatus = payload;
-    broadcast({ type: "status", payload });
+    latestStatus = {
+      ...payload,
+      ts: payload.ts || new Date().toISOString()
+    };
   }
+
+  broadcast({
+    type: 'mqtt_message',
+    topic,
+    payload
+  });
 });
 
-function broadcast(obj) {
-  const data = JSON.stringify(obj);
-  wss.clients.forEach((client) => {
-    if (client.readyState === WebSocket.OPEN) {
-      client.send(data);
-    }
-  });
+function buildCommand(action, params = {}) {
+  return {
+    cmdId: `${Date.now()}`,
+    deviceId: DEVICE_ID,
+    action,
+    params,
+    ts: new Date().toISOString()
+  };
 }
 
-wss.on("connection", (ws) => {
-  console.log("WebSocket client connected");
+function publishCommand(command, res) {
+  if (!mqttClient.connected) {
+    return res.status(500).json({
+      ok: false,
+      error: 'MQTT not connected'
+    });
+  }
 
-  ws.send(JSON.stringify({ type: "status", payload: latestStatus }));
-  ws.send(JSON.stringify({ type: "ack", payload: latestAck }));
+  mqttClient.publish(
+    TOPIC_CMD,
+    JSON.stringify(command),
+    { qos: 1, retain: false },
+    (err) => {
+      if (err) {
+        return res.status(500).json({
+          ok: false,
+          error: err.message
+        });
+      }
 
-  ws.on("close", () => {
-    console.log("WebSocket client disconnected");
+      console.log('MQTT OUT =>', TOPIC_CMD, JSON.stringify(command));
+
+      res.json({
+        ok: true,
+        topic: TOPIC_CMD,
+        command
+      });
+    }
+  );
+}
+
+app.get('/', (req, res) => {
+  res.json({
+    ok: true,
+    service: 'laser control backend',
+    mqttConnected: mqttClient.connected,
+    deviceId: DEVICE_ID,
+    topics: {
+      cmd: TOPIC_CMD,
+      ack: TOPIC_ACK,
+      status: TOPIC_STATUS
+    },
+    latestStatus
   });
 });
 
-app.get("/", (req, res) => {
-  res.send("Laser Control Backend Running");
-});
-
-app.get("/health", (req, res) => {
+app.get('/api/device/status', (req, res) => {
   res.json({
     ok: true,
     mqttConnected: mqttClient.connected,
-    latestStatus,
-    latestAck
+    latestStatus
   });
 });
 
-app.post("/api/device/:id/command", (req, res) => {
-  const { id } = req.params;
-  const { action, params } = req.body;
+app.post('/api/device/start-hmi', (req, res) => {
+  publishCommand(buildCommand('start_hmi'), res);
+});
 
-  if (id !== DEVICE_ID) {
-    return res.status(404).json({ ok: false, error: "Unknown device" });
-  }
+app.post('/api/device/stop-hmi', (req, res) => {
+  publishCommand(buildCommand('stop_hmi'), res);
+});
 
-  const allowedActions = [
-    "start_hmi",
-    "stop_hmi",
-    "show_message",
-    "start_print",
-    "stop_print",
-    "get_status"
-  ];
+app.post('/api/device/start-print', (req, res) => {
+  const { jobName = 'default_job' } = req.body || {};
+  publishCommand(buildCommand('start_print', { jobName }), res);
+});
 
-  if (!allowedActions.includes(action)) {
-    return res.status(400).json({ ok: false, error: "Invalid action" });
-  }
+app.post('/api/device/stop-print', (req, res) => {
+  publishCommand(buildCommand('stop_print'), res);
+});
 
-  const cmd = {
-    cmdId: crypto.randomUUID(),
-    deviceId: id,
-    action,
-    params: params || {},
-    ts: new Date().toISOString()
-  };
+app.post('/api/device/show-message', (req, res) => {
+  const { text = '' } = req.body || {};
+  publishCommand(buildCommand('show_message', { text }), res);
+});
 
-  mqttClient.publish(TOPIC_CMD, JSON.stringify(cmd), { qos: 1 }, (err) => {
-    if (err) {
-      console.error("Publish failed:", err.message);
-      return res.status(500).json({ ok: false, error: "MQTT publish failed" });
-    }
-
-    res.json({ ok: true, cmdId: cmd.cmdId, sent: cmd });
-  });
+app.post('/api/device/get-status', (req, res) => {
+  publishCommand(buildCommand('get_status'), res);
 });
 
 server.listen(PORT, () => {

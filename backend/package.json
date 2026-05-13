@@ -1,17 +1,16 @@
 {
   "name": "laser_control_backend",
   "version": "1.0.0",
+  "description": "Laser remote control backend with Express, WebSocket and MQTT",
   "main": "server.js",
-  "type": "commonjs",
   "scripts": {
     "start": "node server.js"
   },
-  "engines": {
-    "node": "20.x"
-  },
   "dependencies": {
     "cors": "^2.8.5",
-    "express": "^4.18.2",
-    "mqtt": "4.2.8"
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "mqtt": "^5.10.3",
+    "ws": "^8.18.0"
   }
 }
